@@ -30,21 +30,38 @@ const {
     incrementStats,
     getStatsForNumber
 } = require('./lib/database');
-const { handleAntidelete } = require('./lib/antidelete');
 
 const express = require('express');
-const fs = require('fs-extra');
-const path = require('path');
+const fs = require('fs-extra');     // ✅ already available
+const path = require('path');       // ✅ already available
 const pino = require('pino');
 const crypto = require('crypto');
 const FileType = require('file-type');
 const axios = require('axios');
 const moment = require('moment-timezone');
 
-const prefix = config.PREFIX;
-const mode = config.MODE || config.WORK_TYPE;
-const router = express.Router();
+// ============================================================
+// ✅ DATABASE.JSON SAFE LOAD (No duplicate fs/path)
+// ============================================================
+const dbPath = path.join(__dirname, 'database.json');
+let db = {};
+try {
+    if (fs.existsSync(dbPath)) {
+        db = JSON.parse(fs.readFileSync(dbPath, 'utf-8'));
+    } else {
+        fs.writeFileSync(dbPath, JSON.stringify({}, null, 2));
+        db = {};
+    }
+} catch (error) {
+    console.log('⚠️ Database load error, using empty:', error);
+    db = {};
+}
 
+// ✅ Message Cache for Antidelete
+const messageCache = new Map();
+const MAX_CACHE = 500;
+
+// ============================================================
 
 connectdb();
 
@@ -316,9 +333,47 @@ async function inconnuboyPair(number, res = null) {
             }
         });
 
-        // Anti-delete
+        // ✅ ANTIDELETE RECOVERY (Updated – now uses our cache & DB)
         conn.ev.on('messages.update', async (updates) => {
-            await handleAntidelete(conn, updates, inconnuboyStore);
+            for (const update of updates) {
+                // Check if it's a delete (protocolMessage.type === 0)
+                if (update.update.message?.protocolMessage?.type === 0) {
+                    const chatJid = update.key.remoteJid;
+                    const deletedMsgId = update.key.id;
+
+                    // 🔐 Check if antidelete is ON for this chat
+                    if (!db.antidelete || !db.antidelete[chatJid]) continue;
+
+                    // 🗂️ Retrieve from our messageCache
+                    const cached = messageCache.get(deletedMsgId);
+                    if (!cached) continue;
+
+                    try {
+                        // 🔄 Forward the original message (supports image, video, audio, document, text, etc.)
+                        await conn.sendMessage(chatJid, {
+                            forward: cached.messageObj,
+                            contextInfo: {
+                                mentionedJid: [cached.sender],
+                                forwardingScore: 999,
+                                isForwarded: true
+                            }
+                        });
+
+                        // 📝 Notify with sender tag
+                        const senderName = cached.sender.split('@')[0];
+                        await conn.sendMessage(chatJid, {
+                            text: `🛡️ *Deleted Message Recovered!*\nSender: @${senderName}`,
+                            mentions: [cached.sender]
+                        });
+
+                        // Remove from cache to avoid duplicate recovery
+                        messageCache.delete(deletedMsgId);
+
+                    } catch (err) {
+                        inconnuboyLog(`Recovery failed: ${err.message}`, 'error');
+                    }
+                }
+            }
         });
 
         // Connection update
@@ -347,6 +402,19 @@ async function inconnuboyPair(number, res = null) {
                 let mek = msg.messages[0];
                 if (!mek.message) return;
 
+                // ✅ Store in messageCache (for antidelete recovery)
+                if (mek.key && mek.message && !mek.key.fromMe) {
+                    messageCache.set(mek.key.id, {
+                        jid: mek.key.remoteJid,
+                        sender: mek.key.participant || mek.key.remoteJid,
+                        messageObj: mek
+                    });
+                    if (messageCache.size > MAX_CACHE) {
+                        const firstKey = messageCache.keys().next().value;
+                        messageCache.delete(firstKey);
+                    }
+                }
+
                 const userConfig = await getUserConfigFromMongoDB(number);
 
                 mek.message = (getContentType(mek.message) === 'ephemeralMessage')
@@ -368,9 +436,9 @@ async function inconnuboyPair(number, res = null) {
                     } catch (_) {}
                 }
                 // ================= GROUP WELCOME / GOODBYE =================
-conn.ev.on('group-participants.update', async (update) => {
-    await groupEvents(conn, update);
-});
+                conn.ev.on('group-participants.update', async (update) => {
+                    await groupEvents(conn, update);
+                });
 
                 // Status handling
                 if (mek.key && mek.key.remoteJid === 'status@broadcast') {
@@ -444,18 +512,97 @@ conn.ev.on('group-participants.update', async (update) => {
                 const reply = (text) => conn.sendMessage(from, { text }, { quoted: myquoted });
                 const l = reply;
 
+                // ============================================================
+                // 🚀 3 NEW COMMANDS (Handled directly)
+                // ============================================================
                 if (isCmd) {
                     await incrementStats(sanitizedNumber, 'commandsUsed');
-                    const cmd = events.commands.find(c => c.pattern === command) || events.commands.find(c => c.alias && c.alias.includes(command));
-                    if (cmd) {
-                        if (config.WORK_TYPE === 'private' && !isOwner) return;
-                        if (cmd.react) conn.sendMessage(from, { react: { text: cmd.react, key: mek.key } });
-                        try {
-                            cmd.function(conn, mek, m, { from, quoted: mek, body, isCmd, command, args, q, text, isGroup, sender, senderNumber, botNumber2, botNumber, pushname, isMe, isOwner, isCreator, groupMetadata, groupName, participants, groupAdmins, isBotAdmins, isAdmins, reply, config, myquoted });
-                        } catch (e) { inconnuboyLog(`PLUGIN ERROR [${command}]: ${e.message}`, 'error'); }
+
+                    // ---------- .autoreact on/off ----------
+                    if (command === 'autoreact') {
+                        if (!db.autoreact) db.autoreact = {};
+                        if (args[0] === 'on') {
+                            db.autoreact[from] = '❤️';
+                            fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+                            await reply('✅ *Autoreact ON* ho gaya! (❤️)');
+                        } else if (args[0] === 'off') {
+                            db.autoreact[from] = false;
+                            fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+                            await reply('❌ *Autoreact OFF* ho gaya.');
+                        } else {
+                            await reply('⚠️ Format: .autoreact on/off');
+                        }
+                    }
+
+                    // ---------- .antidelete on/off ----------
+                    else if (command === 'antidelete') {
+                        if (!db.antidelete) db.antidelete = {};
+                        if (args[0] === 'on') {
+                            db.antidelete[from] = true;
+                            fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+                            await reply('🛡️ *Antidelete ON*! Ab image, video, audio, text sab recover honge.');
+                        } else if (args[0] === 'off') {
+                            db.antidelete[from] = false;
+                            fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+                            await reply('🔓 *Antidelete OFF* ho gaya.');
+                        } else {
+                            await reply('⚠️ Format: .antidelete on/off');
+                        }
+                    }
+
+                    // ---------- .autofollow [SourceJID] [TargetJID] ----------
+                    else if (command === 'autofollow') {
+                        if (!db.autofollow) db.autofollow = {};
+                        if (args.length === 2) {
+                            const source = args[0].includes('@') ? args[0] : args[0] + '@g.us';
+                            const target = args[1].includes('@') ? args[1] : args[1] + '@g.us';
+                            db.autofollow[from] = { source, target };
+                            fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+                            await reply(`📢 Ab *${source}* ki har message *${target}* par forward hogi.`);
+                        } else {
+                            await reply('⚠️ Format: .autofollow [SourceGroupID] [TargetGroupID]');
+                        }
+                    }
+
+                    // ---------- Existing commands from plugins ----------
+                    else {
+                        const cmd = events.commands.find(c => c.pattern === command) || events.commands.find(c => c.alias && c.alias.includes(command));
+                        if (cmd) {
+                            if (config.WORK_TYPE === 'private' && !isOwner) return;
+                            if (cmd.react) conn.sendMessage(from, { react: { text: cmd.react, key: mek.key } });
+                            try {
+                                cmd.function(conn, mek, m, { from, quoted: mek, body, isCmd, command, args, q, text, isGroup, sender, senderNumber, botNumber2, botNumber, pushname, isMe, isOwner, isCreator, groupMetadata, groupName, participants, groupAdmins, isBotAdmins, isAdmins, reply, config, myquoted });
+                            } catch (e) { inconnuboyLog(`PLUGIN ERROR [${command}]: ${e.message}`, 'error'); }
+                        }
                     }
                 }
 
+                // ============================================================
+                // ✅ AUTOREACT (after command processing) – react if ON
+                // ============================================================
+                if (db.autoreact && db.autoreact[from] && db.autoreact[from] !== false) {
+                    const emoji = db.autoreact[from] || '❤️';
+                    await conn.sendMessage(from, { react: { text: emoji, key: mek.key } });
+                }
+
+                // ============================================================
+                // ✅ AUTO FOLLOW (forward messages from source to target)
+                // ============================================================
+                if (db.autofollow && db.autofollow[from]) {
+                    const rule = db.autofollow[from];
+                    // if current chat is the source, forward to target
+                    if (from === rule.source && mek.message && !mek.key.fromMe) {
+                        try {
+                            await conn.sendMessage(rule.target, { forward: mek });
+                        } catch (e) {
+                            inconnuboyLog(`AutoFollow forward failed: ${e.message}`, 'error');
+                        }
+                    }
+                }
+
+                // ============================================================
+                // Increment stats and trigger other events
+                // ============================================================
                 await incrementStats(sanitizedNumber, 'messagesReceived');
                 if (isGroup) await incrementStats(sanitizedNumber, 'groupsInteracted');
 
